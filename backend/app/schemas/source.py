@@ -7,20 +7,22 @@ class AES67SourceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     network_interface: str = Field(min_length=1, max_length=32)
     multicast_address: str = Field(min_length=7, max_length=48)
-    channel_count: int = Field(ge=1, le=64)
+    rtp_port: int = Field(default=5004, ge=1024, le=65535)
+    channel_count: int = Field(ge=1, le=128)
     sample_rate: int = Field(default=48000)
     bit_depth: int = Field(default=24)
-    alsa_device: str = Field(min_length=1, max_length=128)
+    encoding_name: str = Field(default="L24", max_length=8)
 
 
 class AES67SourceUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     network_interface: str | None = Field(default=None, max_length=32)
     multicast_address: str | None = Field(default=None, max_length=48)
-    channel_count: int | None = Field(default=None, ge=1, le=64)
+    rtp_port: int | None = Field(default=None, ge=1024, le=65535)
+    channel_count: int | None = Field(default=None, ge=1, le=128)
     sample_rate: int | None = None
     bit_depth: int | None = None
-    alsa_device: str | None = Field(default=None, max_length=128)
+    encoding_name: str | None = Field(default=None, max_length=8)
     is_active: bool | None = None
 
 
@@ -29,10 +31,11 @@ class AES67SourceOut(BaseModel):
     name: str
     network_interface: str
     multicast_address: str
+    rtp_port: int
     channel_count: int
     sample_rate: int
     bit_depth: int
-    alsa_device: str
+    encoding_name: str
     is_active: bool
     created_at: datetime
 
@@ -41,8 +44,8 @@ class AES67SourceOut(BaseModel):
 
 class SourceStatus(BaseModel):
     source_id: int
-    alsa_device: str
-    alsa_present: bool
-    stream_locked: bool
+    multicast_address: str
+    stream_active: bool
+    ptp_locked: bool
     detected_channels: int | None
     detected_sample_rate: int | None

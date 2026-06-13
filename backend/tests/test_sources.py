@@ -18,7 +18,7 @@ async def test_create_source(auth_client: AsyncClient):
         "channel_count": 32,
         "sample_rate": 48000,
         "bit_depth": 24,
-        "alsa_device": "hw:AES67_Studio,0",
+        "rtp_port": 5004,
     })
     assert resp.status_code == 201
     data = resp.json()
@@ -34,10 +34,10 @@ async def test_create_source_exceeds_channel_limit(auth_client: AsyncClient):
         "name": "Too Many Channels",
         "network_interface": "eth0",
         "multicast_address": "239.69.0.99",
-        "channel_count": 128,
+        "channel_count": 256,
         "sample_rate": 48000,
         "bit_depth": 24,
-        "alsa_device": "hw:AES67_Big,0",
+        "rtp_port": 5006,
     })
     assert resp.status_code == 422
 
@@ -51,7 +51,7 @@ async def test_update_source(auth_client: AsyncClient):
         "channel_count": 16,
         "sample_rate": 48000,
         "bit_depth": 24,
-        "alsa_device": "hw:AES67_Rename,0",
+        "rtp_port": 5008,
     })
     source_id = create_resp.json()["id"]
 
@@ -72,15 +72,15 @@ async def test_source_status_mock(auth_client: AsyncClient, monkeypatch):
         "channel_count": 32,
         "sample_rate": 48000,
         "bit_depth": 24,
-        "alsa_device": "hw:AES67_Mock,0",
+        "rtp_port": 5010,
     })
     source_id = create_resp.json()["id"]
 
     resp = await auth_client.get(f"/api/sources/{source_id}/status")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["stream_locked"] is True
-    assert data["alsa_present"] is True
+    assert data["stream_active"] is True
+    assert data["ptp_locked"] is True
 
 
 @pytest.mark.asyncio
@@ -92,7 +92,7 @@ async def test_delete_source(auth_client: AsyncClient):
         "channel_count": 8,
         "sample_rate": 48000,
         "bit_depth": 24,
-        "alsa_device": "hw:AES67_Del,0",
+        "rtp_port": 5012,
     })
     source_id = create_resp.json()["id"]
 

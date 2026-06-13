@@ -1,9 +1,13 @@
 """Client for the bondagit/aes67-linux-daemon REST API.
 
-In MOCK_AUDIO mode all calls return synthetic data so the backend
-can be exercised without the kernel module or a live AES-67 stream.
+The daemon is responsible for SAP/mDNS stream discovery and PTP clock
+synchronization. Basin queries it to resolve stream parameters (multicast
+address, RTP port, channel count, sample rate) that are then passed directly
+to GStreamer pipelines. No ALSA device strings are used.
+
+In MOCK_AUDIO mode all calls return synthetic data.
 """
-from pathlib import Path
+from __future__ import annotations
 
 import httpx
 
@@ -14,17 +18,21 @@ _MOCK_STREAMS = [
         "id": "mock-source-a",
         "name": "Mock Stream A",
         "address": "239.69.0.1",
+        "port": 5004,
         "channels": 32,
         "sample_rate": 48000,
         "bit_depth": 24,
+        "encoding_name": "L24",
     },
     {
         "id": "mock-source-b",
         "name": "Mock Stream B",
         "address": "239.69.0.2",
+        "port": 5006,
         "channels": 32,
         "sample_rate": 48000,
         "bit_depth": 24,
+        "encoding_name": "L24",
     },
 ]
 
@@ -43,62 +51,63 @@ async def list_daemon_streams() -> list[dict]:
             return []
 
 
-def _card_name_from_alsa_device(alsa_device: str) -> str:
-    """Extract card name from e.g. 'hw:AES67_Studio,0' → 'AES67_Studio'."""
-    try:
-        return alsa_device.split(":")[1].split(",")[0]
-    except IndexError:
-        return alsa_device
+async def get_stream_params(multicast_address: str) -> dict | None:
+    """Return stream parameters for a given multicast address from the daemon.
+
+    Returns a dict with keys: address, port, channels, sample_rate, bit_depth,
+    encoding_name — or None if the stream is not found.
+    """
+    if settings.mock_audio:
+        for s in _MOCK_STREAMS:
+            if s["address"] == multicast_address:
+                return s
+        return None
+
+    streams = await list_daemon_streams()
+    for s in streams:
+        if s.get("address") == multicast_address:
+            return s
+    return None
 
 
-def _alsa_card_present(card_name: str) -> bool:
-    """Check /proc/asound/cards for the named card without opening the device."""
-    try:
-        content = Path("/proc/asound/cards").read_text()
-        return card_name in content
-    except OSError:
-        return False
-
-
-async def get_source_status(alsa_device: str) -> dict:
+async def get_source_status(multicast_address: str) -> dict:
     """Return live status for a configured source.
 
     Returns:
-        alsa_present   – card is registered in ALSA (stream is being received)
-        stream_locked  – PTP-locked and receiving (same as alsa_present for now;
-                         extended via daemon subscription in a future phase)
+        stream_active  – daemon knows about this stream (SAP/mDNS discovered)
+        ptp_locked     – PTP clock is synchronized (from daemon status endpoint)
         detected_channels, detected_sample_rate – from daemon if available
     """
     if settings.mock_audio:
         return {
-            "alsa_present": True,
-            "stream_locked": True,
+            "stream_active": True,
+            "ptp_locked": True,
             "detected_channels": 32,
             "detected_sample_rate": 48000,
         }
 
-    card_name = _card_name_from_alsa_device(alsa_device)
-    alsa_present = _alsa_card_present(card_name)
+    params = await get_stream_params(multicast_address)
+    if params is None:
+        return {
+            "stream_active": False,
+            "ptp_locked": False,
+            "detected_channels": None,
+            "detected_sample_rate": None,
+        }
 
-    detected_channels = None
-    detected_sample_rate = None
-
-    # Try to get richer info from the daemon
+    ptp_locked = False
     async with httpx.AsyncClient(timeout=2.0) as client:
         try:
-            resp = await client.get(f"{settings.aes67_daemon_url}/api/sources")
+            resp = await client.get(f"{settings.aes67_daemon_url}/api/ptp/status")
             resp.raise_for_status()
-            for stream in resp.json():
-                if card_name.lower() in stream.get("name", "").lower():
-                    detected_channels = stream.get("channels")
-                    detected_sample_rate = stream.get("sample_rate")
-                    break
+            data = resp.json()
+            ptp_locked = data.get("status", "") in ("locked", "tracking")
         except httpx.RequestError:
             pass
 
     return {
-        "alsa_present": alsa_present,
-        "stream_locked": alsa_present,
-        "detected_channels": detected_channels,
-        "detected_sample_rate": detected_sample_rate,
+        "stream_active": True,
+        "ptp_locked": ptp_locked,
+        "detected_channels": params.get("channels"),
+        "detected_sample_rate": params.get("sample_rate"),
     }

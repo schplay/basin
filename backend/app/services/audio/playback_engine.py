@@ -1,8 +1,8 @@
-"""Manages FFmpeg playback sessions for completed recordings.
+"""Manages GStreamer playback sessions for completed recordings.
 
-Playback sends the multi-channel WAV files back to an ALSA output device so
-engineers can review takes through the console or a local monitor.  In
-MOCK_AUDIO mode the session runs a timer with no audio output.
+Reads per-channel WAV files and routes audio to a configurable output — either
+an ALSA sink for local monitoring or a UDP sink to re-emit as AES-67 RTP.
+In MOCK_AUDIO mode the session runs a timer with no audio output.
 """
 from __future__ import annotations
 
@@ -17,14 +17,14 @@ from .filename import render_filename
 
 log = logging.getLogger(__name__)
 
-_PLAYBACK_OUTPUT_DEVICE = "default"  # Override via env / future config
+_SRC_EXT = (".wav", ".flac", ".aif", ".aiff", ".w64", ".caf")
 
 
 @dataclass
 class PlaybackSession:
     recording_id: int
     started_at: datetime
-    process: asyncio.subprocess.Process | None = None
+    pipeline: object | None = None   # Gst.Pipeline
     _task: asyncio.Task | None = None
 
     @property
@@ -32,9 +32,13 @@ class PlaybackSession:
         return (datetime.now(timezone.utc) - self.started_at).total_seconds()
 
     def is_alive(self) -> bool:
-        if self.process is None:
+        if self.pipeline is None:
             return self._task is not None and not self._task.done()
-        return self.process.returncode is None
+        try:
+            from gi.repository import Gst  # type: ignore
+            return self.pipeline.get_state(0)[1] == Gst.State.PLAYING
+        except Exception:
+            return False
 
 
 _sessions: dict[int, PlaybackSession] = {}
@@ -47,9 +51,6 @@ def get_session(recording_id: int) -> PlaybackSession | None:
 def is_playing(recording_id: int) -> bool:
     s = _sessions.get(recording_id)
     return s is not None and s.is_alive()
-
-
-_SRC_EXT = (".wav", ".flac", ".aif", ".aiff", ".w64", ".caf")
 
 
 def _find_channel_file(
@@ -67,28 +68,43 @@ def _find_channel_file(
     return None
 
 
-def _build_playback_command(
+def _build_playback_pipeline_desc(
     filesystem_path: str,
     channel_count: int,
     filename_pattern: str | None = None,
     started_at: datetime | None = None,
-) -> list[str]:
+) -> str:
+    """Build a GStreamer pipeline description for multi-channel playback.
+
+    Reads per-channel WAV files, interleaves them, and sends to ALSA output.
+    """
     path = Path(filesystem_path)
-    inputs: list[str] = []
+    files: list[Path] = []
     for i in range(1, channel_count + 1):
         f = _find_channel_file(path, i, filename_pattern, started_at)
         if f:
-            inputs += ["-i", str(f)]
-    if not inputs:
+            files.append(f)
+
+    if not files:
         raise ValueError(f"No audio files found in {filesystem_path}")
 
-    n = len(inputs) // 2  # each "-i file" is two list entries
-    cmd = ["ffmpeg"] + inputs + [
-        "-filter_complex", f"amix=inputs={n}:dropout_transition=0",
-        "-f", "alsa",
-        _PLAYBACK_OUTPUT_DEVICE,
-    ]
-    return cmd
+    n = len(files)
+    parts: list[str] = []
+
+    # One filesrc+wavparse branch per channel
+    for idx, f in enumerate(files):
+        parts.append(
+            f'filesrc location="{f}" ! wavparse ! audioconvert name=ac{idx}'
+        )
+
+    # Interleave all channels and send to ALSA default output
+    interleave_srcs = " ".join(f"ac{i}." for i in range(n))
+    parts.append(
+        f'interleave name=mix {interleave_srcs}'
+        f' ! audioconvert ! alsasink device=default'
+    )
+
+    return ' '.join(parts)
 
 
 async def start_playback(
@@ -110,17 +126,38 @@ async def start_playback(
         task = asyncio.create_task(_mock_playback_task(session))
         session._task = task
     else:
-        cmd = _build_playback_command(filesystem_path, channel_count, filename_pattern, started_at)
-        log.info("FFmpeg playback: %s", " ".join(cmd))
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        try:
+            import gi
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst  # type: ignore
+            Gst.init(None)
+        except Exception as exc:
+            raise RuntimeError("GStreamer Python bindings not available") from exc
+
+        pipeline_desc = _build_playback_pipeline_desc(
+            filesystem_path, channel_count, filename_pattern, started_at
         )
-        session.process = proc
-        # Watch for natural end-of-file
-        task = asyncio.create_task(_watch_process(session))
-        session._task = task
+        log.info("GStreamer playback pipeline: %s", pipeline_desc)
+
+        pipeline = Gst.parse_launch(pipeline_desc)
+        if pipeline is None:
+            raise RuntimeError("Failed to parse GStreamer playback pipeline")
+
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+
+        def _on_message(bus, msg, sess=session):
+            from gi.repository import Gst as _Gst  # type: ignore
+            if msg.type == _Gst.MessageType.EOS:
+                _sessions.pop(sess.recording_id, None)
+            elif msg.type == _Gst.MessageType.ERROR:
+                err, debug = msg.parse_error()
+                log.error("GStreamer playback error (recording %d): %s — %s",
+                          sess.recording_id, err, debug)
+
+        bus.connect("message", _on_message)
+        pipeline.set_state(Gst.State.PLAYING)
+        session.pipeline = pipeline
 
     _sessions[recording_id] = session
     log.info("Playback started: recording_id=%d mock=%s", recording_id, settings.mock_audio)
@@ -141,31 +178,21 @@ async def stop_playback(recording_id: int) -> float:
 
     duration = session.duration
 
-    if session.process and session.process.returncode is None:
-        session.process.terminate()
+    if session.pipeline:
         try:
-            await asyncio.wait_for(session.process.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            session.process.kill()
-            await session.process.wait()
+            from gi.repository import Gst  # type: ignore
+            bus = session.pipeline.get_bus()
+            bus.remove_signal_watch()
+            session.pipeline.set_state(Gst.State.NULL)
+        except Exception as exc:
+            log.warning("Error stopping playback pipeline: %s", exc)
 
     log.info("Playback stopped: recording_id=%d duration=%.1fs", recording_id, duration)
     return duration
 
 
 async def _mock_playback_task(session: PlaybackSession) -> None:
-    """Keep the session alive until cancelled or the mock 'file' duration elapses."""
     try:
         await asyncio.sleep(86400)
-    except asyncio.CancelledError:
-        pass
-
-
-async def _watch_process(session: PlaybackSession) -> None:
-    """Remove session when FFmpeg finishes naturally (end of files)."""
-    try:
-        if session.process:
-            await session.process.wait()
-        _sessions.pop(session.recording_id, None)
     except asyncio.CancelledError:
         pass

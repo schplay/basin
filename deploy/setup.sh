@@ -20,10 +20,13 @@ apt-get install -y --no-install-recommends \
     nginx \
     nodejs npm \
     git curl wget \
-    build-essential \
-    linux-headers-$(uname -r) \
-    libffi-dev libssl-dev \
+    build-essential cmake \
+    libffi-dev libssl-dev libavahi-client-dev \
     ffmpeg \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+    python3-gst-1.0 gir1.2-gstreamer-1.0 \
     avahi-daemon avahi-utils \
     linuxptp \
     netifaces \
@@ -51,25 +54,16 @@ else
 fi
 chown -R $BASIN_USER:$BASIN_USER "$BASIN_HOME/repo"
 
-echo "==> Installing AES-67 kernel module (ravenna-alsa-lkm)"
+echo "==> Installing AES-67 daemon (aes67-linux-daemon)"
+# The daemon handles SAP/mDNS discovery and PTP coordination.
+# Basin reads stream parameters from its REST API; no ALSA kernel module is needed.
 DRIVER_SRC="$BASIN_HOME/drivers"
 mkdir -p "$DRIVER_SRC"
 
-if [ ! -d "$DRIVER_SRC/ravenna-alsa-lkm" ]; then
-    git clone https://github.com/bondagit/ravenna-alsa-lkm.git "$DRIVER_SRC/ravenna-alsa-lkm"
-fi
-cd "$DRIVER_SRC/ravenna-alsa-lkm"
-make -j$(nproc)
-make install
-depmod -a
-modprobe MergingRavennaALSA || true
-
-echo "==> Installing AES-67 daemon (aes67-linux-daemon)"
 if [ ! -d "$DRIVER_SRC/aes67-linux-daemon" ]; then
     git clone https://github.com/bondagit/aes67-linux-daemon.git "$DRIVER_SRC/aes67-linux-daemon"
 fi
 cd "$DRIVER_SRC/aes67-linux-daemon"
-apt-get install -y cmake libavahi-client-dev libssl-dev
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
@@ -81,6 +75,12 @@ cat > /etc/sysctl.d/99-basin.conf <<'EOF'
 kernel.sched_rt_runtime_us = -1
 EOF
 sysctl -p /etc/sysctl.d/99-basin.conf
+
+echo "==> Verifying GStreamer Python bindings"
+python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; Gst.init(None); print('GStreamer', Gst.version_string())" || {
+    echo "ERROR: GStreamer Python bindings not available — check python3-gst-1.0 install"
+    exit 1
+}
 
 echo "==> Disabling PulseAudio system-wide"
 systemctl --global disable pulseaudio.service pulseaudio.socket 2>/dev/null || true

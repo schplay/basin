@@ -12,6 +12,9 @@ The following decisions deviate from or extend the AES-Capture-Specification.md:
 |---|---|---|---|
 | Project name | AES-Capture | **Basin** | Correct name per David |
 | Database | SQLite | **PostgreSQL** | Multiple concurrent recordings require true concurrency; overbuild for scale |
+| Audio engine | FFmpeg (subprocess) | **GStreamer (GstPython)** | Direct RTP multicast reception without ALSA intermediary; native `rtpjitterbuffer` for AES-67 timing; `level` element for metering; Python object-level pipeline control; proven at 128ch by voc/aes67-recorder |
+| AES-67 capture path | ALSA → FFmpeg | **Multicast RTP → GStreamer pipeline** | bondagit daemon retained for SAP/SDP discovery and PTP coordination; `ravenna-alsa-lkm` kernel module not required for capture |
+| Source identifier | `alsa_device` string | **`multicast_address` + `rtp_port`** | ALSA device string obsolete; GStreamer pipelines address streams by multicast IP and UDP port from daemon SDP |
 | Source per recording | Single `aes67_source_id` | **Per-channel routing table** | Each channel maps independently to a source + source channel index |
 | Concurrent recordings | One at a time | **Multiple concurrent**, with load display | Allowed if hardware has capacity; UI shows load vs. capacity |
 | First boot | Not specified | **Browser setup wizard** (no CLI for end users) | End users never touch CLI |
@@ -67,9 +70,10 @@ metadata_defaults (JSON), created_at
 
 **aes67_sources**
 ```
-id, name, network_interface, multicast_address, channel_count, sample_rate, bit_depth,
-alsa_device, is_active, created_at
+id, name, network_interface, multicast_address, rtp_port, channel_count, sample_rate, bit_depth,
+is_active, created_at
 ```
+Note: `alsa_device` removed. GStreamer pipelines address streams via `multicast_address` + `rtp_port`, obtained from the bondagit daemon SDP at source creation time.
 
 **recordings**
 ```
@@ -137,7 +141,7 @@ basin/
 │   │   ├── schemas/                 # Pydantic request/response schemas
 │   │   ├── routers/                 # FastAPI routers (one per API section)
 │   │   ├── services/
-│   │   │   ├── audio/               # FFmpeg wrapper, recorder, player, meter
+│   │   │   ├── audio/               # GStreamer pipeline builder, recorder, player, meter
 │   │   │   ├── console/             # BaseConsole, X32Console, WingConsole
 │   │   │   ├── storage/             # Destination manager, SMB, NFS
 │   │   │   └── network.py           # Netplan read/write, interface queries
@@ -376,34 +380,42 @@ WS     /ws/exports/{job_id}                      # Progress stream
 
 ### 7.1 Multi-Source Recording
 
-When a recording spans multiple AES-67 sources, channels are grouped by source and a single FFmpeg process is launched with multiple inputs:
+Each AES-67 source gets one GStreamer pipeline. Channels are grouped by source from the `recording_channels` rows, and one pipeline per source handles capture and per-channel file writing.
 
-```bash
-ffmpeg \
-  -f alsa -i hw:SourceA,0 \       # Source A input
-  -f alsa -i hw:SourceB,0 \       # Source B input
-  -filter_complex "
-    [0]channelsplit=channel_layout=32c[a0][a1]...[a31];
-    [1]channelsplit=channel_layout=32c[b0][b1]...[b31]
-  " \
-  -map [a0] -c:a pcm_s24le -rf64 auto ch01_Kick.wav \
-  -map [a3] -c:a pcm_s24le -rf64 auto ch04_HatClose.wav \
-  ...
+**Pipeline structure (per source, e.g. 32ch L24 at 48 kHz):**
+
+```
+udpsrc multicast-group=239.69.0.1 port=5004 multicast-iface=eth0
+  caps="application/x-rtp, media=audio, encoding-name=L24, channels=32, clock-rate=48000"
+  → rtpjitterbuffer latency=20 do-lost=true
+  → rtpL24depay
+  → audio/x-raw, format=S24BE, channels=32, rate=48000
+  → audioconvert
+  → deinterleave name=split
+      split.src_0 → queue → audioconvert → audio/x-raw,format=S24LE → wavenc → filesink location=ch01_Kick.wav
+      split.src_1 → queue → audioconvert → audio/x-raw,format=S24LE → wavenc → filesink location=ch02_Snare.wav
+      ...
 ```
 
-AES-67 sources on the same network are PTP-synchronized, so timing across inputs is coherent. The backend builds the FFmpeg command from the `recording_channels` rows, sorting by `channel_number` and grouping by `source_id` to determine which inputs are needed.
+Only the channels selected in `recording_channels` for that source get a filesink branch; unused source channels are discarded via `fakesink`. AES-67 sources share a PTP grandmaster, so multi-source recordings are sample-accurate.
+
+The pipeline is built as a Python object using `gi.repository.Gst` (GstPython) and managed through GStreamer state transitions (`PLAYING` → `EOS` → `NULL`) rather than subprocess lifecycle management.
+
+**RF64 / large-file support:** `wavenc` in GStreamer writes standard WAV by default. RF64 auto-promotion is handled by a thin post-processing step using the `mutagen` library when the file exceeds 4 GB (same as the FFmpeg `-rf64 auto` flag). AIFF output uses `aiffenc`.
 
 ### 7.2 Level Metering
 
-A secondary lightweight FFmpeg process reads from each active ALSA source and emits per-channel `dBFS` via the `astats` filter at ~4Hz:
+Metering branches off the same pipeline via a `tee` element inserted after `audioconvert`, avoiding a separate process:
 
-```bash
-ffmpeg -f alsa -i hw:SourceA,0 \
-  -af astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=pipe:1 \
-  -f null -
+```
+... audioconvert → tee name=t
+  t.src_0 → deinterleave → filesinks   (recording branch)
+  t.src_1 → level name=lvl interval=250000000 post-messages=true → fakesink sync=false
 ```
 
-The backend parses stdout in a thread, maps channel levels to recording channel numbers, and broadcasts via WebSocket. One metering process per active ALSA source shared across all concurrent recordings using that source.
+The `level` element posts `GstMessage` objects on the pipeline bus every 250 ms (~4 Hz), containing per-channel RMS and peak values as a `GValueArray`. The Python bus watch callback reads these messages, maps channel indices to `recording_channels` channel numbers, and updates the in-memory `RecordingSession.meter_data` list for WebSocket broadcast.
+
+One pipeline per active source handles both recording and metering, reference-counted across concurrent recordings that share the same source.
 
 ### 7.3 Capacity / Load Display
 
@@ -458,51 +470,50 @@ basin ALL=(ALL) NOPASSWD: /usr/local/bin/basin-netplan-helper
 
 The helper accepts a JSON payload on stdin describing the interface config, validates it, writes `/etc/netplan/99-basin.yaml`, and calls `netplan apply`. The FastAPI service never has unrestricted sudo.
 
-### 8.4 AES-67 ALSA Driver Stack
-
-**Decision: Path 1 — Open Source (bondagit/aes67-linux-daemon + Merging RAVENNA LKM)**
-
-Both components are GPL v3. GPL v3 is satisfied for a commercial Linux appliance by including a written source offer with the product (or bundling source on the appliance). No licensing fees.
+### 8.4 AES-67 Capture Stack
 
 **Architecture:**
 
 ```
 Network (multicast RTP/AES-67)
         ↓
-  MergingRavennaALSA.ko     ← GPL v3 kernel module; registers as ALSA PCM device
-        ↓
-  aes67-linux-daemon        ← GPL v3 userspace daemon; handles mDNS/SAP discovery,
-        ↓                     PTP synchronization, stream config, REST API on :8080
-  ALSA virtual PCM device   ← hw:AES67,0  (or named by daemon config)
-        ↓
-  FFmpeg  -f alsa -i hw:AES67,0
+  aes67-linux-daemon        ← GPL v3 userspace daemon; SAP/mDNS discovery,
+        ↓                     PTP sync (via linuxptp), stream metadata, REST API :8080
+  GStreamer pipeline        ← udpsrc → rtpjitterbuffer → rtpL24depay → deinterleave → filesinks
 ```
+
+The `ravenna-alsa-lkm` kernel module is **not required**. GStreamer reads multicast RTP directly from the network stack; no ALSA device is created or used for capture. The bondagit daemon remains responsible for:
+- SAP/mDNS stream advertisement/discovery
+- PTP clock synchronization (via `linuxptp` / `ptp4l`)
+- Providing stream SDP metadata (multicast address, port, encoding, channel count) via its REST API
 
 **Build and install steps (handled by `deploy/setup.sh`):**
 
 ```bash
-# 1. Kernel module dependencies
-apt-get install -y linux-headers-$(uname -r) build-essential git
+# 1. GStreamer runtime and Python bindings
+apt-get install -y \
+  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  python3-gst-1.0 gir1.2-gstreamer-1.0
 
-# 2. Clone and build the Merging RAVENNA LKM
-git clone https://github.com/bondagit/ravenna-alsa-lkm.git /opt/basin/drivers/ravenna-alsa-lkm
-cd /opt/basin/drivers/ravenna-alsa-lkm
-make && make install
-depmod -a
+# 2. PTP synchronization (required for multi-source timing)
+apt-get install -y linuxptp
+# ptp4l configured to lock to AES-67 grandmaster on the audio NIC
 
-# 3. Clone and build the bondagit daemon
+# 3. avahi for mDNS discovery
+apt-get install -y avahi-daemon
+
+# 4. Build and install the bondagit daemon (discovery + PTP coordination only)
+apt-get install -y build-essential git cmake
 git clone https://github.com/bondagit/aes67-linux-daemon.git /opt/basin/drivers/aes67-linux-daemon
 cd /opt/basin/drivers/aes67-linux-daemon
 mkdir build && cd build
 cmake .. && make -j$(nproc)
 make install   # installs to /usr/local/bin/aes67-daemon
 
-# 4. Required sysctl for real-time scheduling (no audio glitches)
+# 5. Real-time scheduling for GStreamer threads
 echo "kernel.sched_rt_runtime_us = -1" >> /etc/sysctl.d/99-basin.conf
 sysctl -p /etc/sysctl.d/99-basin.conf
-
-# 5. PulseAudio must not run (non-issue on Ubuntu Server headless)
-systemctl --global disable pulseaudio || true
 ```
 
 **systemd service `basin-aes67.service`:**
@@ -524,18 +535,17 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-**ALSA device strings exposed to FFmpeg:**
+**Stream parameters stored in `aes67_sources`:**
 
-The daemon config assigns a name to each AES-67 stream. The resolved ALSA device string follows the format `hw:<card_name>,0`. Basin stores this in `aes67_sources.alsa_device` and passes it directly to FFmpeg as `-f alsa -i <alsa_device>`.
+At source creation, Basin queries the daemon's REST API for the stream's SDP and stores `multicast_address` (e.g. `239.69.0.1`) and `rtp_port` (e.g. `5004`) directly. The GStreamer `udpsrc` element uses these to subscribe to the multicast group. No ALSA device string is needed.
 
 **Channel count target:**
 
-64 channels is the current production target. The daemon supports up to 64 sources + 64 sinks, which aligns exactly with this target. Expansion beyond 64 channels (e.g., two 64-ch streams summing to 128) is architecturally possible and may be validated in a future release.
+128 channels is the v1 target, achieved via multiple concurrent GStreamer pipelines (one per AES-67 source). Each pipeline handles one source's channel count independently. GStreamer's element-level concurrency model scales without the 64-channel daemon sink limit that applied to the ALSA path.
 
 **GPL compliance:**
 
 Include in the appliance (e.g., on `/opt/basin/drivers/sources/` or a bundled USB/URL):
-- Source of `ravenna-alsa-lkm` at the exact commit built
 - Source of `aes67-linux-daemon` at the exact commit built
 - A written offer: "The source code for GPL components is available at /opt/basin/drivers/sources/ or by written request to [contact]"
 
@@ -545,8 +555,8 @@ Include in the appliance (e.g., on `/opt/basin/drivers/sources/` or a bundled US
 
 A single aiortc `RTCPeerConnection` is maintained per user session. On channel selection:
 1. Browser sends SDP offer to `GET /api/recordings/{id}/monitor/{channel}`
-2. Backend resolves the channel's ALSA source + source channel
-3. aiortc creates a peer connection and pipes the ALSA channel to an Opus RTP track
+2. Backend resolves the channel's source (`multicast_address`, `rtp_port`, `source_channel`)
+3. A lightweight GStreamer pipeline taps the source's live RTP feed for the selected channel, converts to Opus, and feeds into an aiortc audio track
 4. SDP answer returned; browser plays via Web Audio API
 
 Only one channel per user at a time; selecting a new channel sends a new offer which replaces the previous connection.
@@ -655,23 +665,23 @@ Only one channel per user at a time; selecting a new channel sends a new offer w
 
 ### Phase 4 — Core Recording Engine (Weeks 11–14)
 
-**FFmpeg Wrapper & Recorder**
-- `FFmpegProcess` class: start, monitor stderr, kill, return codes
-- `Recorder` service: builds FFmpeg command from `recording_channels`, starts process, manages lifecycle
-- BWF metadata injection via `-metadata` flags at start
+**GStreamer Recording Engine**
+- `GstPipeline` wrapper: build pipeline from source parameters, set to PLAYING, handle bus messages (EOS, ERROR), set to NULL on stop
+- `Recorder` service: constructs per-source GStreamer pipelines from `recording_channels`, manages pipeline lifecycle
+- BWF metadata written by `wavenc` capsfilter + post-stop `mutagen` BEXT chunk injection
 - Post-stop: write `metadata.json` sidecar, update `ended_at` and `duration_seconds`
 
 **Level Metering**
-- `MeterProcess` class: per-ALSA-source metering process
-- Shared meter process pool: one per active source, reference-counted by active recordings
+- `level` element in each recording pipeline posts bus messages at ~4 Hz
+- Bus watch callback in Python updates `RecordingSession.meter_data` in-memory; one pipeline per active source shared across concurrent recordings using that source
 - Parsed dBFS values published to Redis pub/sub
 - WebSocket endpoint `/ws/recordings/{id}/levels` subscribes to Redis, filters to recording's channels, sends JSON at ~4Hz
 
 **Recording Start/Stop API**
-- `POST /api/recordings/{id}/start`: validates not already recording; spawns FFmpeg and meter; sets status → `recording`
-- `POST /api/recordings/{id}/stop`: sends SIGTERM to FFmpeg; waits for clean exit; sets status → `completed`
-- Error handling: FFmpeg crash → status → `error`; broadcast error event via WebSocket
-- Concurrent recording limit: warn at >90% storage bandwidth; hard block if FFmpeg fails to start
+- `POST /api/recordings/{id}/start`: validates not already recording; sets pipeline state to PLAYING; sets status → `recording`
+- `POST /api/recordings/{id}/stop`: sends EOS event to pipeline; waits for EOS message; sets state to NULL; sets status → `completed`
+- Error handling: GStreamer ERROR bus message → status → `error`; broadcast error event via WebSocket
+- Concurrent recording limit: warn at >90% storage bandwidth; hard block if pipeline fails to reach PLAYING state
 
 **Live View**
 - Vue `/recordings/:id/live` view:
@@ -687,7 +697,7 @@ Only one channel per user at a time; selecting a new channel sends a new offer w
 ### Phase 5 — Playback & WebRTC Monitoring (Weeks 15–17)
 
 **Playback**
-- FFmpeg playback process: reads per-channel files, routes to output ALSA channels
+- GStreamer playback pipeline: `filesrc → wavparse → interleave → udpsink` to re-emit as AES-67 RTP, or `alsasink` for local monitor output (config selectable)
 - Channel re-mapping UI before playback start
 - `POST /api/recordings/{id}/playback/start` / `/stop`
 - Status `playback` added to recording FSM
@@ -850,7 +860,7 @@ MOCK_AUDIO=0
 | C | AES-67 output / re-transmission from appliance | New feature, post-v1 |
 | D | Wing OSC subscription model (`/xremote`) for live channel name sync | Phase 6 enhancement |
 | E | Multi-site / multi-appliance support | Post-v1 |
-| F | Future: expand to 128-channel operation | Post-v1; requires validating two 64-ch AES-67 streams in one recording session |
+| F | 128-channel operation | v1 target; GStreamer pipeline-per-source model supports this without daemon channel limits |
 | G | Future: SMPTE ST 2110 / OMT video recording — see §12 | Post-v1 feature investigation |
 
 ---

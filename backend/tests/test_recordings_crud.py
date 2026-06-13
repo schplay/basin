@@ -28,7 +28,7 @@ async def source_8ch(session: AsyncSession):
         network_interface="eth0",
         channel_count=8,
         sample_rate=48000,
-        alsa_device="hw:0",
+        rtp_port=5004,
     )
     session.add(src)
     await session.commit()

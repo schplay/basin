@@ -16,7 +16,8 @@ class AES67Source(Base, TimestampMixin):
     channel_count: Mapped[int] = mapped_column(Integer, nullable=False)
     sample_rate: Mapped[int] = mapped_column(Integer, nullable=False, default=48000)
     bit_depth: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
-    alsa_device: Mapped[str] = mapped_column(String(128), nullable=False)
+    rtp_port: Mapped[int] = mapped_column(Integer, nullable=False, default=5004)
+    encoding_name: Mapped[str] = mapped_column(String(8), nullable=False, default="L24")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     recording_channels: Mapped[list[RecordingChannel]] = relationship(

@@ -346,7 +346,15 @@ async def start_recording(
         select(AES67Source).where(AES67Source.id.in_(source_ids))
     )
     sources_map = {
-        s.id: {"alsa_device": s.alsa_device, "channel_count": s.channel_count}
+        s.id: {
+            "multicast_address": s.multicast_address,
+            "rtp_port": s.rtp_port,
+            "network_interface": s.network_interface,
+            "channel_count": s.channel_count,
+            "sample_rate": s.sample_rate,
+            "bit_depth": s.bit_depth,
+            "encoding_name": s.encoding_name,
+        }
         for s in src_result.scalars()
     }
 

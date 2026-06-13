@@ -66,11 +66,24 @@ async def monitor_offer(
             format="lavfi",
         )
     else:
-        # Read from the source's ALSA virtual card
-        player = MediaPlayer(
-            f"hw:{_alsa_card_index(src.alsa_device)}",
-            format="alsa",
+        # Receive the multicast RTP stream via GStreamer and feed it to aiortc.
+        # MediaPlayer accepts a GStreamer pipeline description when format="gst-pipeline".
+        # We tap the first channel of the source for the browser listen-in.
+        encoding = getattr(src, "encoding_name", "L24")
+        depay = "rtpL24depay" if encoding == "L24" else "rtpL16depay"
+        raw_fmt = "S24BE" if encoding == "L24" else "S16BE"
+        gst_pipeline = (
+            f"udpsrc multicast-group={src.multicast_address} port={src.rtp_port}"
+            f" multicast-iface={src.network_interface}"
+            f' caps="application/x-rtp,media=audio,encoding-name={encoding},'
+            f"channels={src.channel_count},clock-rate={src.sample_rate}\""
+            f" ! rtpjitterbuffer latency=20"
+            f" ! {depay}"
+            f" ! audio/x-raw,format={raw_fmt},channels={src.channel_count},rate={src.sample_rate}"
+            f" ! audioconvert ! audio/x-raw,format=S16LE,channels=1,rate=48000"
+            f" ! appsink name=sink"
         )
+        player = MediaPlayer(gst_pipeline, format="gst-pipeline")
 
     if player.audio:
         pc.addTrack(player.audio)
@@ -89,9 +102,3 @@ async def monitor_offer(
     await pc.setLocalDescription(answer)
 
     return MonitorAnswer(sdp=pc.localDescription.sdp, type=pc.localDescription.type)
-
-
-def _alsa_card_index(alsa_device: str) -> str:
-    """Extract the card index from 'hw:N' or 'hw:N,M' for use with MediaPlayer."""
-    # alsa_device is e.g. "hw:0" or "hw:0,0"
-    return alsa_device.split(":", 1)[-1] if ":" in alsa_device else alsa_device

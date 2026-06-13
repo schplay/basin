@@ -25,11 +25,6 @@ def clean_engine():
     for s in recording_engine._sessions.values():
         for t in s._tasks:
             t.cancel()
-        for proc in s.record_processes:
-            if proc.returncode is None:
-                proc.terminate()
-        if s.meter_process and s.meter_process.returncode is None:
-            s.meter_process.terminate()
     recording_engine._sessions.clear()
 
 
@@ -54,7 +49,7 @@ async def source(session: AsyncSession):
         network_interface="eth0",
         channel_count=8,
         sample_rate=48000,
-        alsa_device="hw:0",
+        rtp_port=5004,
     )
     session.add(src)
     await session.commit()

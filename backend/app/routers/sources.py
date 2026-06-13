@@ -84,5 +84,5 @@ async def source_status(
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source not found")
 
-    live = await get_source_status(source.alsa_device)
-    return SourceStatus(source_id=source_id, alsa_device=source.alsa_device, **live)
+    live = await get_source_status(source.multicast_address)
+    return SourceStatus(source_id=source_id, multicast_address=source.multicast_address, **live)
