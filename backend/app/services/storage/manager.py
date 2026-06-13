@@ -5,7 +5,7 @@ import shutil
 import time
 from pathlib import Path
 
-CHANNEL_COUNTS = [8, 16, 24, 32, 48, 64]
+CHANNEL_COUNTS = [8, 16, 24, 32, 48, 64, 96, 128]
 SAMPLE_RATES = [44100, 48000, 88200, 96000]
 _BIT_DEPTH = 24
 _SAFETY_MARGIN = 1.2

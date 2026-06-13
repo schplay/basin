@@ -4,9 +4,9 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class ChannelConfig(BaseModel):
-    channel_number: int = Field(ge=1, le=64)
+    channel_number: int = Field(ge=1, le=128)
     source_id: int
-    source_channel: int = Field(ge=1, le=64)
+    source_channel: int = Field(ge=1, le=128)
     channel_name: str = Field(default="", max_length=128)
 
 

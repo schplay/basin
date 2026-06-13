@@ -130,9 +130,9 @@ async def test_template_with_source_defaults(auth_client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_channel_count_max_64(auth_client: AsyncClient):
+async def test_channel_count_max_128(auth_client: AsyncClient):
     resp = await auth_client.post(
-        "/api/templates", json={"name": "Too Big", "channel_count": 65}
+        "/api/templates", json={"name": "Too Big", "channel_count": 129}
     )
     assert resp.status_code == 422
 

@@ -10,7 +10,7 @@ class ChannelSourceDefault(BaseModel):
 
 class RecordingTemplateCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    channel_count: int = Field(ge=1, le=64)
+    channel_count: int = Field(ge=1, le=128)
     channel_names: list[str] = Field(default_factory=list)
     sample_rate: int = Field(default=48000)
     bit_depth: int = Field(default=24)
@@ -30,7 +30,7 @@ class RecordingTemplateCreate(BaseModel):
 
 class RecordingTemplateUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
-    channel_count: int | None = Field(default=None, ge=1, le=64)
+    channel_count: int | None = Field(default=None, ge=1, le=128)
     channel_names: list[str] | None = None
     sample_rate: int | None = None
     bit_depth: int | None = None
