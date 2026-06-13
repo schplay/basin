@@ -1,0 +1,18 @@
+[Unit]
+Description=Basin API Server
+After=network.target postgresql.service redis.service
+Requires=postgresql.service redis.service
+
+[Service]
+Type=simple
+User=basin
+WorkingDirectory=/opt/basin/repo/backend
+EnvironmentFile=/opt/basin/repo/backend/.env
+ExecStart=/opt/basin/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

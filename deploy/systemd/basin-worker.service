@@ -1,0 +1,18 @@
+[Unit]
+Description=Basin Celery Worker
+After=network.target redis.service postgresql.service
+Requires=redis.service
+
+[Service]
+Type=simple
+User=basin
+WorkingDirectory=/opt/basin/repo/backend
+EnvironmentFile=/opt/basin/repo/backend/.env
+ExecStart=/opt/basin/venv/bin/celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.merging.com)",
+      "WebFetch(domain:www.ravenna-network.com)",
+      "WebFetch(domain:merging.com)"
+    ]
+  }
+}

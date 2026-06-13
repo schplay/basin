@@ -1,0 +1,16 @@
+[Unit]
+Description=Basin AES-67 Daemon
+After=network.target avahi-daemon.service
+Wants=avahi-daemon.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/aes67-daemon -c /opt/basin/data/aes67-daemon.conf
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
